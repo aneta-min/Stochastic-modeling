@@ -1,0 +1,664 @@
+---
+title: "Projekt"
+format: html
+editor: visual
+code-fold: false
+code-tools: true
+embed-resources: true
+---
+
+# Projekt: Stochastická analýza akcií společnosti Colt CZ Group SE
+
+```{r}
+#| echo: true
+#| warning: false
+#| message: false
+
+if(!require(quantmod)) install.packages("quantmod")
+library(quantmod)
+if(!require(moments)) install.packages("moments")
+if(!require(nortest)) install.packages("nortest")
+library(moments)
+library(nortest)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(knitr)
+library(MASS)
+library(tidyverse)
+library(zoo)
+
+
+```
+
+### Definice funkcí
+
+```{r}
+simulate_price_paths <- function(
+  prices,
+  dates,
+  M = 1000,
+  return_generator,
+  x0 = NULL
+) {
+
+  N <- length(prices)
+
+  if (is.null(x0)) {
+    x0 <- as.numeric(prices[1])
+  }
+
+  set.seed(123)
+
+  sim_returns <- return_generator(M, N)
+
+  sim_prices <- matrix(NA, nrow = M, ncol = N)
+  sim_prices[, 1] <- x0
+
+  for (i in 1:M) {
+    sim_prices[i, 2:N] <- x0 * exp(cumsum(sim_returns[i, ]))
+  }
+
+  mean_traj <- apply(sim_prices, 2, mean)
+
+  lower_ci <- apply(sim_prices, 2, quantile, probs = 0.025)
+  upper_ci <- apply(sim_prices, 2, quantile, probs = 0.975)
+
+  summary_df <- tibble(
+    Date  = dates,
+    Real  = as.numeric(prices),
+    Mean  = mean_traj,
+    Lower = lower_ci,
+    Upper = upper_ci
+  )
+
+  sample_paths <- sample(1:M, 100)
+
+  paths_df <- purrr::map_dfr(
+    sample_paths,
+    \(i) tibble(
+      Date = dates,
+      Price = sim_prices[i, ],
+      Path = as.factor(i)
+    )
+  )
+
+  list(
+    sim_prices = sim_prices,
+    summary_df = summary_df,
+    paths_df = paths_df
+  )
+}
+
+gbm_returns <- function(M, N, mu, sigma, dt = 1/252) {
+  matrix(
+    rnorm(
+      M * (N - 1),
+      mean = (mu - 0.5 * sigma^2) * dt,
+      sd   = sigma * sqrt(dt)
+    ),
+    nrow = M
+  )
+}
+
+t_returns <- function(M, N, m, s, nu) {
+
+  z <- rt(M * (N - 1), df = nu)
+
+  matrix(
+    m + s * z,
+    nrow = M
+  )
+}
+
+plot_simulation <- function(sim_obj, title = "") {
+
+  ggplot() +
+
+    geom_line(
+      data = sim_obj$paths_df,
+      aes(Date, Price, group = Path),
+      color = "grey70",
+      alpha = 0.5,
+      linewidth = 0.3
+    ) +
+
+    geom_ribbon(
+      data = sim_obj$summary_df,
+      aes(Date, ymin = Lower, ymax = Upper),
+      fill = "red",
+      alpha = 0.2
+    ) +
+
+    geom_line(
+      data = sim_obj$summary_df,
+      aes(Date, Mean),
+      color = "red",
+      linetype = 3,
+      linewidth = 0.8
+    ) +
+
+    geom_line(
+      data = sim_obj$summary_df,
+      aes(Date, Real),
+      color = "black",
+      linewidth = 0.8
+    ) +
+
+    theme_minimal() +
+
+    labs(title = title, x = "", y = "Cena akcie (CZK)")
+}
+```
+
+## 1. Úvod a představení dat
+
+Tento projekt se zabývá stochastickou analýzou a modelováním cen akcií společnosti **Colt CZ**. Datový soubor obsahující denní uzavírací ceny byl stažen z portálu Yahoo Finance pod tickerem `CZG.PR`. Sledované období začíná 24. února 2022 (začátek války na Ukrajině) a zachycuje dynamický růst ceny v reakci na geopolitické šoky.
+
+```{r}
+#| results: "hide"
+#| message: false
+symbol <- "CZG.PR"
+start_date <- "2022-02-24"
+end_date <- Sys.Date()
+invisible(getSymbols(symbol,
+                      src = "yahoo",
+                      from = start_date,
+                      to = end_date))
+prices <- Cl(get(symbol))
+```
+
+```{r}
+df <- prices |>
+  as.data.frame() |>
+  rownames_to_column("Date") |>
+  mutate(Date = as.Date(Date),
+         Year = lubridate::year(Date)) |>
+  rename(Price = CZG.PR.Close) |>
+  mutate(Returns = c(NA, diff(log(Price))))
+  
+
+events <- data.frame(
+  date = as.Date(c(
+    "2025-11-20",
+    "2025-05-22",
+    "2026-03-25",
+    "2022-02-24"
+  )),
+  label = c(
+    "Outlook cut",
+    "Q1 results",
+    "FY prelim",
+    "Russian invasion"
+  )
+)
+
+ggplot(df, aes(Date, Price)) +
+  geom_line() +
+  geom_vline(data = events, aes(xintercept = date),
+         linetype = "dashed", alpha = 0.6) +
+  geom_text(data = events,
+        aes(x = date, y = 1000, label = label),
+        angle = 90, vjust = -0.5, alpha = 0.6) +
+  geom_text(data = events,
+        aes(x = date, y = 550, label = as.character(date)),
+        angle = 90, vjust = -0.5, size = 3, alpha = 0.7) +
+  theme_minimal() +
+  labs(y = "Cena akcie (CZK)", x = "")
+
+```
+
+```{r}
+dt <- 1/252
+
+threshold <- 3 * sd(df$Returns, na.rm = TRUE)
+
+df <- df |>
+  mutate(
+    Jump = abs(Returns) > threshold
+  )
+
+ggplot(df, aes(Date, Returns)) +
+  
+  geom_hline(yintercept = 0,
+             color = "grey50") +
+  
+  geom_segment(aes(
+    xend = Date,
+    y = 0,
+    yend = Returns,
+    color = Jump
+  ),
+  linewidth = 0.4,
+  alpha = 0.8) +
+  
+  geom_point(aes(color = Jump),
+             size = 1.8) +
+  scale_color_manual(values = c(
+    "FALSE" = "grey40",
+    "TRUE" = "red"
+  )) +
+  
+  theme_minimal() +
+  
+  theme(
+    legend.position = "none"
+  ) +
+  
+  labs(
+    y = "Logaritmické výnosy",
+    x = ""
+  )
+```
+
+```{r}
+stats_tbl <- tibble(
+  Metrika = c("Průměr", "Rozptyl", "Šikmost", "Špičatost"),
+  Hodnota = with(df, c(
+    mean(Returns, na.rm = TRUE),
+    var(Returns, na.rm = TRUE),
+    skewness(Returns, na.rm = TRUE),
+    kurtosis(Returns, na.rm = TRUE)
+  ))
+)
+
+kable(stats_tbl, caption = "Základní statistiky logaritmických výnosů")
+```
+
+## 2. Ověření předpokladů modelu
+
+```{r}
+# histogram
+ggplot(df, aes(Returns)) +
+  geom_histogram(aes(y = ..density..), bins = 50, alpha = 0.6) +
+  stat_function(fun = dnorm,
+                args = list(mean = mean(df$Returns, na.rm=TRUE),
+                            sd = sd(df$Returns, na.rm=TRUE)), 
+                col = "red", lty = 3, alpha = 0.8) +
+  ggtitle("Histogram výnosů") +
+  labs(x = "Logaritmické výnosy", y = "Odhad hustoty") +
+  theme_minimal()
+
+# qq plot
+ggplot(df, aes(sample = Returns)) +
+  stat_qq(alpha = 0.6) +
+  stat_qq_line(color = "red", lty = 3, alpha = 0.8) +
+  theme_minimal() +
+  labs(
+    title = "Q-Q graf logaritmických výnosů",
+    x = "Teoretické kvantily",
+    y = "Empirické kvantily"
+  )
+
+acf(na.omit(df$Returns), main="Autokorelační funkce")
+```
+
+```{r}
+print(shapiro.test(as.numeric(df$Returns)))
+print(lillie.test(as.numeric(df$Returns))) 
+```
+
+Oba testy jednoznačně zamítají hypotézu normality. Také grafická analýza ukazuje na tzv. těžké chvosty v rozdělení logaritmických výnosů. Toto porušení předpokladů budeme v první fázi ignorovat a simulaci provedeme pomocí klasického modelu geometrického Brownova pohybu. Zjištěné odchylky však budou sloužit jako motivace pro zavedení alternativního modelu.
+
+## 3. Parametry modelu a simulace
+
+Parametry klasického GBM modelu jsme odhadli pomocí momentové metody.
+
+```{r}
+R_bar <- mean(na.omit(df$Returns))
+S_sq  <- var(na.omit(df$Returns))
+r_hat <- (R_bar / dt) + (S_sq / (2 * dt))
+sigma_hat <- sqrt(S_sq / dt)
+```
+
+### Simulace
+
+```{r}
+gbm_sim <- simulate_price_paths(
+  prices = df$Price,
+  dates = df$Date,
+  M = 1000,
+  return_generator = function(M, N)
+    gbm_returns(M, N, r_hat, sigma_hat)
+)
+plot_simulation(gbm_sim, "Simulace - klasický GBM")
+
+```
+
+## 4. Diskuse alternativních modelů
+
+Přestože byl pro základní model zvolen geometrický Brownův pohyb s lineárním driftovým i volatilním členem, empirická data vykazují těžké chvosty a skokové změny, což motivuje změnu modelu.
+
+### Studentovo rozdělení
+
+```{r}
+#| warning: false
+fit_t <- fitdistr(na.omit(df$Returns), densfun = "t")
+
+nu <- fit_t$estimate["df"]
+m <- fit_t$estimate["m"] 
+s <- fit_t$estimate["s"]
+
+t_sim <- simulate_price_paths(
+  prices = df$Price,
+  dates = df$Date,
+  M = 1000,
+  return_generator = function(M, N)
+    t_returns(M, N, m, s, nu)
+)
+plot_simulation(t_sim, "Simulace - Studentovo t rozdělení")
+```
+
+### Rozdělení po letech
+
+```{r}
+params_by_year <- df |>
+  drop_na(Returns) |>
+  group_by(Year) |>
+  summarise(
+    R_bar = mean(Returns),
+    S_sq  = var(Returns),
+    sigma_hat = sqrt(S_sq / dt),
+    mu_hat = (R_bar / dt) + (S_sq / (2 * dt)),
+    .groups = "drop"
+  )
+
+params_by_year
+
+piecewise_gbm_returns <- function(M, N, dates, params_df) {
+
+  out <- matrix(NA, nrow = M, ncol = N - 1)
+
+  for(t in 1:(N - 1)) {
+
+    current_year <- lubridate::year(dates[t])
+
+    pars <- params_df |>
+      filter(Year == current_year)
+
+    mu    <- pars$mu_hat
+    sigma <- pars$sigma_hat
+
+    out[, t] <- rnorm(
+      M,
+      mean = (mu - 0.5 * sigma^2) * dt,
+      sd   = sigma * sqrt(dt)
+    )
+  }
+
+  out
+}
+
+piecewise_sim <- simulate_price_paths(
+  prices = df$Price,
+  dates  = df$Date,
+  M = 10000,
+
+  return_generator = function(M, N)
+    piecewise_gbm_returns(
+      M = M,
+      N = N,
+      dates = df$Date,
+      params_df = params_by_year
+    )
+)
+
+
+plot_simulation(
+  piecewise_sim,
+  "Simulace - GBM s parametry odhadovanými po letech"
+)
+```
+
+### Rolling volatility
+
+```{r}
+roll_sd <- rollapply(
+  df$Returns,
+  width = 30,
+  FUN = sd,
+  fill = NA,
+  align = "right"
+)
+
+rolling_sigma <- roll_sd / sqrt(dt)
+
+R_bar <- mean(df$Returns, na.rm = TRUE)
+S_sq  <- var(df$Returns, na.rm = TRUE)
+
+mu_hat <- (R_bar / dt) + (S_sq / (2 * dt))
+
+rolling_sigma[is.na(rolling_sigma)] <- mean(
+  rolling_sigma,
+  na.rm = TRUE
+)
+
+rolling_gbm_returns <- function(
+  M,
+  N,
+  mu,
+  sigma_vector,
+  dt = 1/252
+) {
+
+  out <- matrix(NA, nrow = M, ncol = N - 1)
+
+  for(t in 1:(N - 1)) {
+
+    sigma_t <- sigma_vector[t]
+
+    out[, t] <- rnorm(
+      M,
+      mean = (mu - 0.5 * sigma_t^2) * dt,
+      sd   = sigma_t * sqrt(dt)
+    )
+  }
+
+  out
+}
+
+rolling_sim <- simulate_price_paths(
+  prices = df$Price,
+  dates  = df$Date,
+  M = 10000,
+
+  return_generator = function(M, N)
+    rolling_gbm_returns(
+      M = M,
+      N = N,
+      mu = mu_hat,
+      sigma_vector = rolling_sigma
+    )
+)
+
+plot_simulation(
+  rolling_sim,
+  "Simulace - GBM s časově proměnnou volatilitou"
+)
+```
+
+### Mertonův model skokové difúze
+
+```{r}
+# pocitani parametru
+
+merton_params <- df |>
+  summarise(
+    lambda_hat = mean(Jump, na.rm = TRUE),
+    mu_hat = mean(Returns[!Jump], na.rm = TRUE),
+    sigma_hat = sd(Returns[!Jump], na.rm = TRUE),
+    mu_J_hat = mean(Returns[Jump], na.rm = TRUE),
+    sigma_J_hat = sd(Returns[Jump], na.rm = TRUE)
+
+  )
+
+# print parametru
+
+params_tbl <- tibble(
+  Parametr = c(
+    "$\\mu$",
+    "$\\sigma$",
+    "$\\lambda$",
+    "$\\mu_J$",
+    "$\\sigma_J$"
+  ),
+  Hodnota = round(
+    c(
+      merton_params$mu_hat,
+      merton_params$sigma_hat,
+      merton_params$lambda_hat,
+      merton_params$mu_J_hat,
+      merton_params$sigma_J_hat
+    ),
+    5
+  )
+)
+
+kable(
+  params_tbl,
+  caption = "Odhady parametrů Mertonova jump-diffusion modelu",
+  align = c("c", "r"),
+  escape = FALSE
+)
+
+ggplot(df, aes(Date, Price)) +
+  geom_line() +
+  geom_point(data = df[df$Jump == TRUE, ],
+             aes(Date, Price),
+             color = "red", size = 2) +
+  theme_minimal() +
+  labs(
+    title = "Poloha detekovaných skoků",
+    x = "",
+    y = "Cena akcie (CZK)"
+  )
+```
+
+```{r}
+generate_jumps <- function(n, dt, x0, mu, sigma, lambda, mu_j, sigma_j) {
+
+  t <- seq(0, n * dt, by = dt)   # délka n+1
+
+  W <- c(0, cumsum(rnorm(n, sd = sqrt(dt))))
+  jumps <- numeric(n + 1)
+   for (i in 2:(n + 1)) {
+    Nj <- rpois(1, lambda * dt)
+    if (Nj > 0) {
+      jumps[i] <- sum(rnorm(Nj, mu_j, sigma_j))
+    }
+  }
+
+  jumps <- cumsum(jumps)
+
+  kappa <- exp(mu_j + 0.5 * sigma_j^2) - 1
+
+  X <- x0 * exp((mu - lambda * kappa - 0.5 * sigma^2) * t +
+                sigma * W +
+                jumps)
+
+  return(X)
+}
+Returns <- na.omit(df$Returns)
+R_bar <- mean(Returns, na.rm = TRUE)
+S_sq  <- var(Returns, na.rm = TRUE)
+
+mu_hat <- R_bar
+sigma_hat <- sqrt(S_sq)
+
+set.seed(123)
+M = 1000
+  
+X <- replicate(
+  M,
+  generate_jumps(
+    n = nrow(df) - 1,    
+    dt = dt,
+    x0 = df$Price[1],
+    mu = mu_hat,
+    sigma = sigma_hat,
+    lambda = merton_params$lambda_hat / dt,
+    mu_j = merton_params$mu_J_hat,
+    sigma_j = merton_params$sigma_J_hat
+  )
+)
+
+mean_traj <- apply(X, 1, mean)
+
+quantiles <- apply(
+  X,
+  1,
+  quantile,
+  probs = c(0.025, 0.975),
+  na.rm = TRUE
+)
+
+dates_seq <- df$Date
+
+X_subset <- X[, sample(1:ncol(X), 100)]
+
+```
+
+```{r}
+
+# subset trajektorií do df formátu
+paths_df <- tibble(
+  Date = rep(dates_seq, times = ncol(X_subset)),
+  Price = as.vector(X_subset),
+  Path = rep(
+    1:ncol(X_subset),
+    each = nrow(X_subset)))
+
+summary_df <- tibble(
+  Date  = dates_seq,
+  Real  = prices,
+  Mean  = mean_traj,
+  Lower = quantiles[1, ],
+  Upper = quantiles[2, ]
+)
+
+ggplot() +
+
+  geom_line(
+    data = paths_df,
+    aes(Date, Price, group = Path),
+    color = "lightgray",
+    linewidth = 0.4,
+    alpha = 0.6
+  ) +
+
+  geom_ribbon(
+    data = summary_df,
+    aes(x = Date, ymin = Lower, ymax = Upper),
+    fill = "red",
+    alpha = 0.2
+  ) +
+
+  geom_line(
+    data = summary_df,
+    aes(Date, Mean),
+    color = "red",
+    linewidth = 0.8,
+    lty = 3
+  ) +
+
+  geom_line(
+    data = summary_df,
+    aes(Date, Real),
+    color = "black",
+    linewidth = 1
+  ) +
+
+  theme_minimal() +
+
+  labs(
+    title = "Simulace - Mertonův model se skoky",
+    x = "",
+    y = "Cena (CZK)"
+  )
+```
+
+## 6. Závěr
+
+-   Zhodnocení přesnosti modelu GBM pro akcie Colt CZ Group. Pro naše data stačil už i obyčejný GBM model bez alternativních rozptylů.
+-   Vyhodnocení, zda se skutečná cena pohybovala v rámci predikovaného 95% intervalu spolehlivosti. Až na šoky na začátku v pohodě. To ale nebyl schopen zachytit žádný model
+-   Shrnutí vlivu porušení předpokladu normality na výslednou predikci. Stejná odpoveď jako předtím.
