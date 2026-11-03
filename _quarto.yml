@@ -2,7 +2,7 @@ project:
   type: website
 
 website:
-  title: "Roll Call Data Analysis"
+  title: "Stochastic model"
 
 format:
   html:
