@@ -32,3 +32,6 @@ V projektu jsou využívány klasické i rozšířené stochastické modely pro 
 ## Výstup
 
 Výsledkem projektu je statistická analýza vývoje akcií Colt CZ Group SE a aplikace stochastických modelů na finanční časovou řadu.
+
+[Rozkliknout analýzu](https://aneta-min.github.io/Stochastic-modeling/) |
+[Rozkliknout zdrojový kód](https://github.com/aneta-min/Stochastic-modeling/blob/main/Projekt.qmd)
